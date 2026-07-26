@@ -1,0 +1,133 @@
+name: Build emucap PPSSPP for Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_gui:
+        description: Also try to build PPSSPPSDL.exe
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64
+    runs-on: windows-2025
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out emucap
+        uses: actions/checkout@v4
+
+      - name: Build the pinned and patched PPSSPP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $commit = '56c694d88bbf82270e8b472fe63abd60f3f8e0a9'
+          $workRoot = Join-Path $env:GITHUB_WORKSPACE 'adapters\ppsspp\work'
+          $sourceRoot = Join-Path $workRoot 'ppsspp'
+          $buildRoot = Join-Path $sourceRoot 'build-headless'
+          New-Item -ItemType Directory -Path $workRoot -Force | Out-Null
+
+          git clone --recurse-submodules https://github.com/hrydgard/ppsspp.git $sourceRoot
+          if ($LASTEXITCODE -ne 0) { throw 'PPSSPP clone failed.' }
+          git -C $sourceRoot checkout $commit
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned PPSSPP checkout failed.' }
+          git -C $sourceRoot submodule update --init --recursive
+          if ($LASTEXITCODE -ne 0) { throw 'PPSSPP submodule update failed.' }
+
+          Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'adapters\ppsspp\patches') -File -Filter '*.patch' |
+            Sort-Object Name |
+            ForEach-Object {
+              Write-Host "Applying $($_.Name)"
+              git -C $sourceRoot apply --check $_.FullName
+              if ($LASTEXITCODE -ne 0) { throw "Patch check failed: $($_.Name)" }
+              git -C $sourceRoot apply $_.FullName
+              if ($LASTEXITCODE -ne 0) { throw "Patch apply failed: $($_.Name)" }
+            }
+
+          cmake -S $sourceRoot -B $buildRoot -A x64 -DHEADLESS=ON -DCMAKE_BUILD_TYPE=Release
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed.' }
+          cmake --build $buildRoot --config Release --target PPSSPPHeadless --parallel
+          if ($LASTEXITCODE -ne 0) { throw 'PPSSPPHeadless build failed.' }
+
+          if ('${{ inputs.build_gui }}' -eq 'true') {
+            cmake --build $buildRoot --config Release --target PPSSPPSDL --parallel
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning 'PPSSPPSDL failed; the required PPSSPPHeadless build is still usable.'
+            }
+          }
+
+      - name: Stage binaries, assets, and provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceRoot = Join-Path $env:GITHUB_WORKSPACE 'adapters\ppsspp\work\ppsspp'
+          $stageRoot = Join-Path $env:GITHUB_WORKSPACE 'emucap-ppsspp-windows-x64'
+          New-Item -ItemType Directory -Path $stageRoot | Out-Null
+
+          $headless = Get-ChildItem -LiteralPath $sourceRoot -Recurse -File -Filter 'PPSSPPHeadless.exe' |
+            Sort-Object FullName |
+            Select-Object -First 1
+          if (-not $headless) {
+            throw 'PPSSPPHeadless.exe was not produced.'
+          }
+          Copy-Item -LiteralPath $headless.FullName -Destination (Join-Path $stageRoot 'PPSSPPHeadless.exe')
+
+          $gui = Get-ChildItem -LiteralPath $sourceRoot -Recurse -File -Filter 'PPSSPPSDL.exe' |
+            Sort-Object FullName |
+            Select-Object -First 1
+          if ($gui) {
+            Copy-Item -LiteralPath $gui.FullName -Destination (Join-Path $stageRoot 'PPSSPPSDL.exe')
+          }
+
+          $assets = Join-Path $sourceRoot 'assets'
+          if (Test-Path -LiteralPath $assets) {
+            Copy-Item -LiteralPath $assets -Destination (Join-Path $stageRoot 'assets') -Recurse
+          }
+
+          $commit = git -C $sourceRoot rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not read the pinned PPSSPP commit.'
+          }
+          $expectedCommit = '56c694d88bbf82270e8b472fe63abd60f3f8e0a9'
+          if ($commit.Trim() -ne $expectedCommit) {
+            throw "Unexpected PPSSPP commit: $commit"
+          }
+
+          $manifest = [ordered]@{
+            schema = 'emucap_ppsspp_windows_artifact_v1'
+            ppsspp_commit = $commit.Trim()
+            emucap_commit = (git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim()
+            runner = $env:ImageOS
+            files = @()
+            patches = @()
+          }
+          Get-ChildItem -LiteralPath $stageRoot -File | Sort-Object Name | ForEach-Object {
+            $manifest.files += [ordered]@{
+              name = $_.Name
+              size = $_.Length
+              sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
+          }
+          Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'adapters\ppsspp\patches') -File -Filter '*.patch' |
+            Sort-Object Name |
+            ForEach-Object {
+              $manifest.patches += [ordered]@{
+                name = $_.Name
+                sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              }
+            }
+          $manifest | ConvertTo-Json -Depth 5 |
+            Set-Content -LiteralPath (Join-Path $stageRoot 'BUILD_MANIFEST.json') -Encoding utf8
+
+      - name: Upload the Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: emucap-ppsspp-windows-x64
+          path: emucap-ppsspp-windows-x64
+          if-no-files-found: error
+          retention-days: 14
