@@ -49,7 +49,14 @@ jobs:
               if ($LASTEXITCODE -ne 0) { throw "Patch apply failed: $($_.Name)" }
             }
 
-          cmake -S $sourceRoot -B $buildRoot -A x64 -DHEADLESS=ON -DCMAKE_BUILD_TYPE=Release
+          # PPSSPP's Windows headless source includes Media Foundation GUIDs from CaptureDevice.cpp
+          # and ImageList_* helpers from Windows/W32Util/Misc.cpp.  The normal Windows GUI target
+          # links these SDK libraries, but the upstream PPSSPPHeadless target does not.  Inject only
+          # the two missing Windows default libraries at link time; no PPSSPP source file is edited.
+          $windowsHeadlessDefaultLibs = @('mfuuid.lib', 'comctl32.lib')
+          $linkerFlags = ($windowsHeadlessDefaultLibs | ForEach-Object { "/DEFAULTLIB:$_" }) -join ' '
+
+          cmake -S $sourceRoot -B $buildRoot -A x64 -DHEADLESS=ON -DCMAKE_BUILD_TYPE=Release "-DCMAKE_EXE_LINKER_FLAGS=$linkerFlags"
           if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed.' }
           cmake --build $buildRoot --config Release --target PPSSPPHeadless --parallel
           if ($LASTEXITCODE -ne 0) { throw 'PPSSPPHeadless build failed.' }
@@ -99,10 +106,11 @@ jobs:
           }
 
           $manifest = [ordered]@{
-            schema = 'emucap_ppsspp_windows_artifact_v1'
+            schema = 'emucap_ppsspp_windows_artifact_v2'
             ppsspp_commit = $commit.Trim()
             emucap_commit = (git -C $env:GITHUB_WORKSPACE rev-parse HEAD).Trim()
             runner = $env:ImageOS
+            windows_headless_default_libraries = @('mfuuid.lib', 'comctl32.lib')
             files = @()
             patches = @()
           }
